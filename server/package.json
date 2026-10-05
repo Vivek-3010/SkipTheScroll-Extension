@@ -1,0 +1,25 @@
+{
+  "name": "skipthescroll-server",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Backend for SkipTheScroll - analyzes YouTube comments with Gemini to produce a community verdict.",
+  "main": "src/index.js",
+  "scripts": {
+    "dev": "node --watch src/index.js",
+    "start": "node src/index.js",
+    "check:gemini": "node scripts/check-gemini.mjs",
+    "test:live": "node scripts/live-gemini-test.mjs",
+    "test": "node scripts/smoke-utils.mjs && node scripts/smoke-pipeline.mjs",
+    "test:utils": "node scripts/smoke-utils.mjs",
+    "test:pipeline": "node scripts/smoke-pipeline.mjs"
+  },
+  "engines": {
+    "node": ">=18.17"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "express": "^5.1.0"
+  }
+}

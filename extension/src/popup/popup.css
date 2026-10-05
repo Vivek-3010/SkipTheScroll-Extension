@@ -1,0 +1,83 @@
+@import 'tailwindcss';
+@source '../';
+
+html,
+body {
+  width: 400px;
+  margin: 0;
+  padding: 0;
+  background: #f8fafc;
+  color: #0f172a;
+  font-family:
+    ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+}
+
+#root {
+  width: 400px;
+}
+
+/* Thin scrollbar so the popup stays compact */
+.sts-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: #cbd5e1 transparent;
+}
+.sts-scroll::-webkit-scrollbar {
+  width: 8px;
+}
+.sts-scroll::-webkit-scrollbar-thumb {
+  background-color: #cbd5e1;
+  border-radius: 999px;
+}
+.sts-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+@keyframes sts-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+.sts-spinner {
+  animation: sts-spin 0.9s linear infinite;
+}
+
+@keyframes sts-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.4;
+  }
+}
+.sts-pulse {
+  animation: sts-pulse 1.6s ease-in-out infinite;
+}
+
+@keyframes sts-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+.sts-in {
+  animation: sts-in 0.22s ease-out both;
+}
+
+.sts-clamp-2 {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.sts-clamp-3 {
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
