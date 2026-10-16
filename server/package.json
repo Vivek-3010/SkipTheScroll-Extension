@@ -3,13 +3,13 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "Backend for SkipTheScroll - analyzes YouTube comments with Gemini to produce a community verdict.",
+  "description": "Backend for SkipTheScroll - analyzes YouTube comments with Groq to produce a community verdict.",
   "main": "src/index.js",
   "scripts": {
     "dev": "node --watch src/index.js",
     "start": "node src/index.js",
-    "check:gemini": "node scripts/check-gemini.mjs",
-    "test:live": "node scripts/live-gemini-test.mjs",
+    "check:groq": "node scripts/check-groq.mjs",
+    "test:live": "node scripts/live-groq-test.mjs",
     "test": "node scripts/smoke-utils.mjs && node scripts/smoke-pipeline.mjs",
     "test:utils": "node scripts/smoke-utils.mjs",
     "test:pipeline": "node scripts/smoke-pipeline.mjs"

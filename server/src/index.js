@@ -3,7 +3,7 @@ import cors from 'cors'
 import { config } from './config/env.js'
 import analyzeRoutes from './routes/analyze.routes.js'
 import { isApiError } from './utils/ApiError.js'
-import { verifyGeminiSetup } from './services/gemini.service.js'
+import { verifyAiSetup } from './services/groq.service.js'
 
 const app = express()
 
@@ -17,33 +17,24 @@ function keyLine(label, key) {
 }
 
 function logStartup() {
-  const { gemini, youtube } = config
+  const { groq, youtube } = config
   console.log('\n  ---- SkipTheScroll server configuration ----')
   console.log(`  Env file            : ${config.loadedEnvFile || 'NOT FOUND (using process env)'}`)
   console.log(`  Port                : ${config.port}`)
   console.log(keyLine('YouTube API key', youtube))
-  console.log(keyLine('Gemini API key', gemini))
-  console.log(`  Model               : ${gemini.model}`)
-  console.log(`  Gemini API version  : ${gemini.apiVersion}`)
-  console.log(
-    `  Thinking budget     : ${gemini.thinkingBudget === null ? 'not sent (model default)' : gemini.thinkingBudget}`
-  )
-  console.log(`  Comment cap         : ${config.comments.max}`)
-  console.log(`  Batch size          : ${gemini.batchSize}  |  concurrency: ${gemini.concurrency}`)
-
-  // Quota maths: every analysis costs one call per batch plus one synthesis.
-  // The Gemini free tier allows only a handful of requests per day per model,
-  // so this number decides how many analyses a key can do per day.
-  const worstCaseBatches = Math.ceil(config.comments.max / gemini.batchSize)
-  console.log(
-    `  Gemini calls/run    : ${worstCaseBatches} batch + 1 synthesis = ${worstCaseBatches + 1} (worst case, ${config.comments.max} comments)`
-  )
+  console.log(keyLine('Groq API key', groq))
+  console.log(`  Model               : ${groq.model}`)
+  console.log(`  AI endpoint         : https://api.groq.com/openai/v1/chat/completions`)
+  console.log(`  Max tokens          : ${groq.maxTokens} (shared with reasoning; sent as reasoning_effort=low)`)
+  console.log(`  Request token budget: ${groq.requestTokenBudget} (prompt + max_tokens per AI call)`)
+  console.log(`  Comment cap         : ${config.comments.max} threads (fetch + analysis, no AI cap)`)
+  console.log(`  AI calls/run        : 1 when all comments fit one request, otherwise paced batches + 1 synthesis`)
   console.log(`  Cache TTL           : ${config.cache.ttlMs}ms`)
   console.log('  --------------------------------------------')
 
   const malformed = [
     ['YOUTUBE_API_KEY', youtube],
-    ['GEMINI_API_KEY', gemini],
+    ['GROQ_API_KEY', groq],
   ].filter(([, key]) => !key.looksValid)
 
   for (const [name, key] of malformed) {
@@ -75,13 +66,14 @@ app.get('/api/health', (req, res) => {
     service: 'skipthescroll-server',
     uptimeSeconds: Math.round(process.uptime()),
     commentCap: config.comments.max,
-    model: config.gemini.model,
-    geminiApiVersion: config.gemini.apiVersion,
-    thinkingBudget: config.gemini.thinkingBudget,
+    aiProvider: 'groq',
+    model: config.groq.model,
+    maxTokens: config.groq.maxTokens,
+    requestTokenBudget: config.groq.requestTokenBudget,
     // Fingerprints only - enough to prove which key is loaded, useless if stolen.
     keys: {
       youtube: `sha256:${config.youtube.fingerprint}`,
-      gemini: `sha256:${config.gemini.fingerprint}`,
+      groq: `sha256:${config.groq.fingerprint}`,
     },
   })
 })
@@ -133,8 +125,8 @@ const server = app.listen(config.port, () => {
 
   // Prove the model + key combination works before a user tries to analyse.
   // Non-blocking, and never prevents the server from starting.
-  if (config.gemini.startupCheck) {
-    verifyGeminiSetup().catch(() => {})
+  if (config.groq.startupCheck) {
+    verifyAiSetup().catch(() => {})
   }
 })
 

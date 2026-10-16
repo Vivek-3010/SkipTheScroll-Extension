@@ -95,7 +95,13 @@ export default function VerdictView({ data, onReanalyze, onReset, busy = false }
     analysis.doesItWork || (tone.label === 'Insufficient evidence' ? 'Not enough evidence' : 'Unclear')
 
   const commentsAnalyzed = stats.commentsAnalyzed || 0
+  const repliesAnalyzed = stats.repliesAnalyzed ?? stats.replyComments ?? 0
+  const analyzedTotal = commentsAnalyzed + repliesAnalyzed
   const totalComments = stats.commentCountOnYouTube || video.commentCount || 0
+  const shownAnalyzed = totalComments > 0 ? Math.min(analyzedTotal, totalComments) : analyzedTotal
+  const droppedTotal = stats.droppedTotal || 0
+  const failedBatches = stats.failedBatches || 0
+  const fetchLimit = meta.commentCap || stats.fetchLimit || null
   const signalTotal = (stats.successSignals || 0) + (stats.failureSignals || 0)
 
   return (
@@ -142,7 +148,7 @@ export default function VerdictView({ data, onReanalyze, onReset, busy = false }
           </div>
           <div className="mt-1.5 flex items-center justify-between text-[10px] text-slate-500">
             <span>
-              {formatCount(commentsAnalyzed)} of {formatCount(totalComments)} comments analysed
+              {formatCount(shownAnalyzed)} of {formatCount(totalComments)} comments analysed
             </span>
             <span>
               {stats.successSignals || 0}✓ / {stats.failureSignals || 0}✗ signals
@@ -150,8 +156,19 @@ export default function VerdictView({ data, onReanalyze, onReset, busy = false }
           </div>
           {stats.truncated && (
             <p className="mt-1 text-[10px] leading-relaxed text-amber-700">
-              Top {formatCount(commentsAnalyzed)} comments only (V1 limit is 500). Rare minority experiences may be
-              missing.
+              Only the most relevant {formatCount(shownAnalyzed)} of {formatCount(totalComments)} comments were fetched
+              {fetchLimit ? ` (fetch limit: ${formatCount(fetchLimit)})` : ''}. Rare minority experiences may be missing.
+            </p>
+          )}
+          {!stats.truncated && droppedTotal > 0 && (
+            <p className="mt-1 text-[10px] leading-relaxed text-slate-500">
+              {formatCount(droppedTotal)} short, duplicate or spam comments were skipped.
+            </p>
+          )}
+          {failedBatches > 0 && (
+            <p className="mt-1 text-[10px] leading-relaxed text-amber-700">
+              {formatCount(failedBatches)} comment batch{failedBatches === 1 ? '' : 'es'} could not be analysed (AI rate
+              limit). Re-run the analysis in a few minutes for full coverage.
             </p>
           )}
         </div>
@@ -259,6 +276,9 @@ export default function VerdictView({ data, onReanalyze, onReset, busy = false }
         <p className="text-[10px] leading-relaxed text-slate-400">
           {signalTotal} first-hand signal{signalTotal === 1 ? '' : 's'} detected
           {stats.maxLikes ? ` | top comment had ${formatCount(stats.maxLikes)} likes` : ''}
+          {meta.analysisMode === 'batched' || (stats.batchesAnalyzed || 0) > 1
+            ? ` | ${stats.batchesAnalyzed || meta.aiCalls || 1} AI pass${(stats.batchesAnalyzed || 1) === 1 ? '' : 'es'}`
+            : ''}
           {meta.tookMs ? ` | took ${(meta.tookMs / 1000).toFixed(1)}s` : ''}
           {meta.model ? ` | ${meta.model}` : ''}
         </p>

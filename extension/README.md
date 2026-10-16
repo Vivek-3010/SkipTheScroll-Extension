@@ -53,7 +53,7 @@ If you use a non-localhost host, add it to `host_permissions` in `public/manifes
 | `src/components/VerdictView.jsx`  | Verdict, confidence meter, summary, issues, fixes, timestamps, status, warnings, conflicts, evidence gaps |
 | `src/lib/api.js`              | `fetch` wrapper with timeouts and normalised `{ code, message, hint }` errors |
 | `src/lib/youtube.js`          | URL parsing (`watch?v=`, `youtu.be`, `/shorts/`, `/embed/`, `/live/`), number formatting |
-| `src/lib/constants.js`        | Backend URL, 500 cap, timeouts, progress stages, verdict/status colour maps |
+| `src/lib/constants.js`        | Backend URL, fetch cap (`MAX_COMMENTS`), timeouts, progress stages, verdict/status colour maps |
 
 ## Popup states
 

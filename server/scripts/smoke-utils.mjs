@@ -4,8 +4,7 @@ import { validateVideoId, extractVideoId, isValidVideoId } from '../src/utils/va
 import { cleanComments, cleanText } from '../src/utils/cleanComments.js'
 import { chunk, mapWithConcurrency } from '../src/utils/arrays.js'
 import { withRetry } from '../src/utils/retry.js'
-import { buildBatchPrompt } from '../src/prompts/batchPrompt.js'
-import { buildFinalPrompt } from '../src/prompts/finalPrompt.js'
+import { buildAllInOnePrompt, FINAL_SCHEMA, ALLOWED_VERDICTS } from '../src/prompts/allInOnePrompt.js'
 
 let failed = 0
 function check(name, actual, expected) {
@@ -100,7 +99,7 @@ const retried = await withRetry(
   async () => {
     attempts += 1
     const err = new Error('flaky')
-    err.code = 'GEMINI_SERVER_ERROR'
+    err.code = 'GROQ_SERVER_ERROR'
     if (attempts < 3) throw err
     return 'ok'
   },
@@ -132,15 +131,10 @@ const video = {
   duration: 'PT10M',
   commentCount: 4310,
 }
-const batchPrompt = buildBatchPrompt({ video, comments, batchIndex: 0, batchCount: 3 })
-check('batch prompt mentions batch 1 of 3', batchPrompt.prompt.includes('BATCH 1 OF 3'), true)
-check('batch prompt includes comment text', batchPrompt.prompt.includes('installer fails silently'), true)
-check('batch prompt has injection warning', batchPrompt.system.includes('UNTRUSTED DATA'), true)
-check('batch prompt warns against top-comment bias', batchPrompt.system.includes('most liked comment'), true)
 
-const finalPrompt = buildFinalPrompt({
+const allInOne = buildAllInOnePrompt({
   video,
-  batches: [{ successPatterns: ['worked for me'], batchNotes: 'ok' }],
+  comments,
   stats: {
     threadsFetched: 500,
     commentsAnalyzed: 500,
@@ -152,14 +146,23 @@ const finalPrompt = buildFinalPrompt({
     failureSignals: 18,
     oldestCommentAt: '2023-05-01T00:00:00Z',
     newestCommentAt: '2025-01-02T03:04:05Z',
-    batchesAnalyzed: 10,
-    batchesRequested: 10,
+    batchesAnalyzed: 1,
+    batchesRequested: 1,
   },
 })
-check('final prompt includes stats', finalPrompt.prompt.includes('Threads analysed after cleaning: 500'), true)
-check('final prompt includes batch findings', finalPrompt.prompt.includes('worked for me'), true)
-check('final prompt has injection warning', finalPrompt.system.includes('UNTRUSTED DATA'), true)
-check('final prompt lists allowed verdicts', finalPrompt.system.includes('insufficient evidence'), true)
+check('all-in-one prompt includes comment text', allInOne.prompt.includes('installer fails silently'), true)
+check('all-in-one prompt includes video info', allInOne.prompt.includes('How to fix your PC in 10 minutes'), true)
+check('all-in-one prompt includes hard stats', allInOne.prompt.includes('Threads analysed after cleaning: 500'), true)
+check('all-in-one prompt has injection warning', allInOne.system.includes('UNTRUSTED DATA'), true)
+check('all-in-one prompt warns against speculation', allInOne.system.includes('speculation'), true)
+check('all-in-one prompt lists allowed verdicts', ALLOWED_VERDICTS.includes('insufficient evidence'), true)
+check('all-in-one prompt asks for one schema shape', allInOne.prompt.includes('Return ONLY the JSON object described by the schema'), true)
+
+// Long comments must be truncated so the whole set stays inside the token budget.
+const longComment = { author: 'x', text: 'w'.repeat(1200), likes: 1, publishedAt: null, replies: [], flags: {} }
+const longPrompt = buildAllInOnePrompt({ video, comments: [longComment], stats: {} })
+check('long comments are truncated (ellipsis, full text dropped)', longPrompt.prompt.includes('…') && !longPrompt.prompt.includes('w'.repeat(1200)), true)
+check('schema is the final verdict shape', FINAL_SCHEMA.properties.verdict.type, 'STRING')
 
 console.log(`\n${failed === 0 ? 'ALL CHECKS PASSED' : `${failed} CHECK(S) FAILED`}`)
 process.exit(failed === 0 ? 0 : 1)

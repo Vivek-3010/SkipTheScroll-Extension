@@ -1,19 +1,25 @@
 /**
- * End-to-end pipeline test with YouTube + Gemini mocked (no API keys, no network).
- * Run: node scripts/smoke-pipeline.mjs
+ * End-to-end pipeline test with YouTube + Groq mocked (no real API keys, no
+ * network). Run: node scripts/smoke-pipeline.mjs
  *
  * Verifies:
  *  - metadata fetch
- *  - comment pagination that hard-stops at the 500 comment cap
+ *  - comment pagination that stops at the MAX_COMMENTS thread cap
  *  - cleaning (spam / short / duplicates dropped)
- *  - batching into 50-comment batches, bounded concurrency
- *  - batch -> final synthesis call counts
+ *  - a large comment section is analysed in MULTIPLE paced AI batches
+ *    (extraction per batch + one synthesis call), never a "top 60 only" pass
+ *  - transient 429s (incl. Groq's TPM wording that links to the billing page)
+ *    are retried, while plan-quota 429s and 4xx are never retried
+ *  - the 429 misclassification bug: a tokens-per-minute burst is NOT a quota
  *  - the exact JSON contract the Chrome extension consumes
+ *  - the API key only ever travels in an Authorization header, never a query
  */
 process.env.YOUTUBE_API_KEY ||= 'test-youtube-key'
-process.env.GEMINI_API_KEY ||= 'test-gemini-key'
-process.env.GEMINI_BATCH_SIZE ||= '50'
+process.env.GROQ_API_KEY ||= 'test-groq-key'
 process.env.CACHE_TTL_MS ||= '0'
+// Pin the cap the assertions below rely on so a developer's local server/.env
+// (dotenv does not override already-set vars) cannot change the subject under test.
+process.env.MAX_COMMENTS ||= '500'
 
 import fs from 'node:fs'
 import os from 'node:os'
@@ -21,11 +27,31 @@ import path from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { spawnSync } from 'node:child_process'
 
-const { analyze, buildMergedAnalysis } = await import('../src/controllers/analyze.controller.js')
-const { analyzeBatch } = await import('../src/services/gemini.service.js')
+const { analyze } = await import('../src/controllers/analyze.controller.js')
+const {
+  analyzeAllAtOnce,
+  analyzeComments,
+  mapGroqError,
+  toJsonSchema,
+  buildRequestBody,
+  packCommentBatches,
+  parseRateLimit,
+  parseDuration,
+  normalizeExtraction,
+  setJsonSchemaSupported,
+  supportsJsonSchema,
+  redact,
+} = await import('../src/services/groq.service.js')
+const {
+  FINAL_SCHEMA,
+  EXTRACTION_SCHEMA,
+  buildExtractionPrompt,
+  buildSynthesisPrompt,
+  mergeExtractions,
+} = await import('../src/prompts/allInOnePrompt.js')
 const { config } = await import('../src/config/env.js')
 const { RETRYABLE_CODES, PATIENCE_OVERRIDES } = await import('../src/utils/retry.js')
-const { ALLOWED_VERDICTS } = await import('../src/prompts/finalPrompt.js')
+const { ALLOWED_VERDICTS } = await import('../src/prompts/allInOnePrompt.js')
 const ANALYSIS_VERDICTS = ALLOWED_VERDICTS.map((verdict) => verdict.toLowerCase())
 
 let failed = 0
@@ -38,16 +64,14 @@ function check(name, actual, expected) {
 /* ------------------------------- fake APIs ------------------------------- */
 
 const TOTAL_COMMENTS_ON_YOUTUBE = 1200
-const calls = { videos: 0, commentThreads: 0, commentThreadPages: [], geminiBatches: 0, geminiFinal: 0 }
+const calls = { videos: 0, commentThreads: 0, commentThreadPages: [], aiAnalysis: 0, aiExtraction: 0, aiSynthesis: 0 }
 
 /** Switchable fixture behaviour for the degraded-path scenarios below. */
 const scenario = {
   commentCount: TOTAL_COMMENTS_ON_YOUTUBE,
   commentsDisabled: false,
-  failBatches: new Set(),
-  failAllGemini: false,
-  failFinal: false,
-  geminiFailure: null, // { status, payload }
+  failAnalysisWith: null, // { status, payload } returned for EVERY analysis attempt
+  aiFailuresBeforeSuccess: 0, // fail the first N analysis attempts (429), then succeed
 }
 
 const SUCCESS_COMMENTS = [
@@ -102,18 +126,82 @@ function makeThread(index) {
   }
 }
 
+/** Groq's real transient tokens-per-minute rate limit message (includes the billing hint). */
+const TPM_RATE_LIMIT = {
+  message:
+    'Rate limit reached for model `openai/gpt-oss-120b` in organization `org_x` service tier `on_demand` ' +
+    'on tokens per minute (TPM): Limit 8000, Used 5794, Requested 3501. Please try again in 9.712499999s. ' +
+    'Need more tokens? Upgrade to Dev Tier today at https://console.groq.com/settings/billing',
+  type: 'tokens',
+  code: 'rate_limit_exceeded',
+}
+
 globalThis.fetch = async (url, options = {}) => {
   const target = String(url)
   const attemptCounter = (calls.attempts = calls.attempts || {})
 
-  if (target.includes('generativelanguage.googleapis.com')) {
-    const key = target.includes('models/') ? target.match(/models\/([^:]+):/)?.[1] : 'unknown'
-    attemptCounter[key] = (attemptCounter[key] || 0) + 1
+  if (target.includes('api.groq.com/openai/v1/chat/completions')) {
+    attemptCounter.ai = (attemptCounter.ai || 0) + 1
 
-    if (scenario.geminiFailure) {
-      const { status, payload } = scenario.geminiFailure
+    // Transient burst before a success (the misclassification regression path).
+    if (scenario.aiFailuresBeforeSuccess > 0) {
+      scenario.aiFailuresBeforeSuccess -= 1
+      return jsonResponse({ error: TPM_RATE_LIMIT }, { status: 429 })
+    }
+    if (scenario.failAnalysisWith) {
+      const { status, payload } = scenario.failAnalysisWith
       return jsonResponse(payload, { status })
     }
+
+    const body = JSON.parse(options.body)
+    const prompt = body.messages.find((m) => m.role === 'user')?.content || ''
+
+    // The batched flow makes two kinds of call. Extraction batches carry a
+    // "BATCH CONTEXT" block; the final synthesis carries the merged batches.
+    if (prompt.includes('BATCH CONTEXT')) {
+      if (!prompt.includes('COMMENTS (raw, untrusted data')) {
+        throw new Error(`unexpected extraction prompt: ${prompt.slice(0, 80)}`)
+      }
+      calls.aiExtraction += 1
+      calls.aiAnalysis += 1
+      return chatResponse({
+        commonIssues: [{ issue: 'Installer fails silently on Linux', mentions: 4 }],
+        helpfulFixes: [{ fix: 'Run the installer with --verbose', mentions: 2 }],
+        timestamps: [{ time: '4:20', note: 'the flag that fixes the silent failure' }],
+        warnings: [],
+        conflictingOpinions: ['Works on Windows 11, fails on macOS Sonoma'],
+        successReports: 90,
+        failureReports: 12,
+      })
+    }
+
+    if (prompt.includes('MERGED BATCH EXTRACTIONS')) {
+      calls.aiSynthesis += 1
+    } else if (!prompt.includes('COMMENTS (raw, untrusted data')) {
+      throw new Error(`unexpected prompt for the analysis call: ${prompt.slice(0, 80)}`)
+    }
+    calls.aiAnalysis += 1
+
+    // A fenced block, like a chatty model sometimes emits, to prove parsing works.
+    return chatResponse(
+      {
+        verdict: 'Mostly works',
+        doesItWork: 'Mostly',
+        confidence: 82,
+        confidenceReason: 'Many independent success reports, a small recurring failure group on Linux.',
+        summary: 'Most people report the fix works. A recurring group on Linux cannot get past the installer.',
+        commonIssues: [{ issue: 'Installer fails silently on Linux', mentions: 9 }],
+        helpfulFixes: [{ fix: 'Run the installer with --verbose', mentions: 4 }],
+        timestamps: [{ time: '4:20', note: 'the flag that fixes the silent failure' }],
+        status: 'Possibly outdated',
+        warnings: ['Mentions a third-party mirror that may be unsafe'],
+        conflictingOpinions: ['Works on Windows 11, fails on macOS Sonoma'],
+        evidenceGaps: ['Almost no Linux reports'],
+        successReports: 210,
+        failureReports: 31,
+      },
+      { fenced: true, reasoning: 'thinking about it' }
+    )
   }
 
   if (target.includes('/youtube/v3/videos')) {
@@ -164,97 +252,32 @@ globalThis.fetch = async (url, options = {}) => {
     return jsonResponse(body)
   }
 
-  if (target.includes('generativelanguage.googleapis.com')) {
-    const body = JSON.parse(options.body)
-    const prompt = body.contents[0].parts[0].text
-
-    if (prompt.includes('YOU ARE ANALYSING BATCH')) {
-      calls.geminiBatches += 1
-      const batchNumber = Number(prompt.match(/BATCH (\d+) OF/)?.[1] || 0)
-      if (scenario.failAllGemini || scenario.failBatches.has(batchNumber)) {
-        return jsonResponse({ error: { code: 500, message: 'Internal error', status: 'INTERNAL' } }, { status: 500 })
-      }
-      return jsonResponse({
-        candidates: [
-          {
-            content: {
-              parts: [
-                {
-                  text: JSON.stringify({
-                    successPatterns: ['Multiple commenters confirm the fix works on Windows and macOS'],
-                    failurePatterns: ['Installer silently fails for a few Linux users'],
-                    commonIssues: [{ issue: 'Installer fails silently on Linux', mentions: 3 }],
-                    helpfulFixes: [{ fix: 'Run the installer with --verbose to see the real error', mentions: 2 }],
-                    timestamps: [{ time: '4:20', note: 'the flag that fixes the silent failure' }],
-                    outdatedIndicators: ['One commenter says the menu changed in the latest version'],
-                    warnings: [],
-                    conflictingExperiences: ['Works on Windows, fails on macOS Sonoma'],
-                    evidenceGaps: ['No reports from Linux users in this batch'],
-                    batchNotes: 'Mostly positive first-hand reports with a small failing group.',
-                  }),
-                },
-              ],
-            },
-          },
-        ],
-      })
-    }
-
-    calls.geminiFinal += 1
-    if (scenario.failFinal) {
-      return jsonResponse(
-        {
-          error: {
-            code: 429,
-            status: 'RESOURCE_EXHAUSTED',
-            message:
-              'You exceeded your current quota, please check your plan and billing details.\n' +
-              '* Quota exceeded for metric: generativelanguage.googleapis.com/generate_content_free_tier_requests, limit: 20\n' +
-              'Please retry in 6h57m59.13s.',
-          },
-        },
-        { status: 429 }
-      )
-    }
-    return jsonResponse({
-      candidates: [
-        {
-          content: {
-            parts: [
-              {
-                text: '```json\n' +
-                  JSON.stringify({
-                    verdict: 'Mostly works',
-                    doesItWork: 'Mostly',
-                    confidence: 82,
-                    confidenceReason: 'Many independent success reports, a small recurring failure group on Linux.',
-                    summary: 'Most people report the fix works. A recurring group on Linux cannot get past the installer.',
-                    commonIssues: [{ issue: 'Installer fails silently on Linux', mentions: 9 }],
-                    helpfulFixes: [{ fix: 'Run the installer with --verbose', mentions: 4 }],
-                    timestamps: [{ time: '4:20', note: 'the flag that fixes the silent failure' }],
-                    status: 'Possibly outdated',
-                    warnings: ['Mentions a third-party mirror that may be unsafe'],
-                    conflictingOpinions: ['Works on Windows 11, fails on macOS Sonoma'],
-                    evidenceGaps: ['Almost no Linux reports'],
-                    successReports: 210,
-                    failureReports: 31,
-                  }) +
-                  '\n```',
-              },
-            ],
-          },
-        },
-      ],
-    })
-  }
-
   throw new Error(`unexpected fetch: ${target}`)
+}
+
+/** Wraps a payload in the OpenAI-compatible chat completion envelope. */
+function chatResponse(payload, { fenced = false, reasoning = null } = {}) {
+  const text = fenced ? '```json\n' + JSON.stringify(payload) + '\n```' : JSON.stringify(payload)
+  return jsonResponse({
+    id: 'chatcmpl-test',
+    object: 'chat.completion',
+    model: 'openai/gpt-oss-120b',
+    choices: [
+      {
+        index: 0,
+        finish_reason: 'stop',
+        message: reasoning ? { role: 'assistant', content: text, reasoning } : { role: 'assistant', content: text },
+      },
+    ],
+    usage: { prompt_tokens: 4000, completion_tokens: 1200, total_tokens: 5200 },
+  })
 }
 
 function jsonResponse(body, init = {}) {
   return {
     ok: init.status ? init.status < 400 : true,
     status: init.status || 200,
+    headers: init.headers || new Map(),
     json: async () => body,
   }
 }
@@ -284,31 +307,38 @@ const data = payload?.data
 
 check('response ok', payload?.ok, true)
 check('videos.list called once', calls.videos, 1)
-check('comment pages fetched', calls.commentThreads, 5)
-check('first page maxResults', calls.commentThreadPages[0].maxResults, 100)
-check('pages walk forward', calls.commentThreadPages.map((p) => p.start), [0, 100, 200, 300, 400])
-check('comment cap respected (never above 500)', data?.stats?.commentsAnalyzed <= 500, true)
+check('comment pages fetched until the 500-thread cap', calls.commentThreads, 5)
+check('pagination page size is 100', calls.commentThreadPages[0].maxResults, 100)
+check('pages walk forward from 0 in steps of 100', calls.commentThreadPages.map((p) => p.start), [0, 100, 200, 300, 400])
+check('thread cap never exceeded', data?.stats?.threadsFetched, 500)
 check('every fetched thread is analysed or dropped', data?.stats?.commentsAnalyzed + data?.stats?.droppedTotal, 500)
-check('truncated flag', data?.stats?.truncated, true)
-check('batches requested', data?.stats?.batchesRequested, 10)
-check('batches analysed', data?.stats?.batchesAnalyzed, 10)
-check('gemini batch calls', calls.geminiBatches, 10)
-check('gemini final calls', calls.geminiFinal, 1)
+check('comments were actually kept (not capped at 60 anymore)', data?.stats?.commentsAnalyzed > 60, true)
+check('truncated flag (more threads exist than the cap)', data?.stats?.truncated, true)
+check('large set is split into multiple batches', data?.stats?.batchesRequested >= 2, true)
+check('every batch was analysed', data?.stats?.batchesAnalyzed, data?.stats?.batchesRequested)
+check('no failed batches on the happy path', data?.stats?.failedBatches, 0)
+check('extraction call per batch', calls.aiExtraction, data?.stats?.batchesAnalyzed)
+check('exactly one synthesis call', calls.aiSynthesis, 1)
+check('aiCalls = batches + synthesis', data?.stats?.aiCalls, data?.stats?.batchesAnalyzed + 1)
+check('all AI calls reached the mocked API', calls.aiAnalysis, data?.stats?.aiCalls)
+check('analysis mode is batched', data?.stats?.analysisMode, 'batched')
 check('verdict', data?.analysis?.verdict, 'mostly works')
 check('confidence clamped 0-100', typeof data?.analysis?.confidence === 'number' && data.analysis.confidence <= 100, true)
 check('summary present', typeof data?.analysis?.summary === 'string' && data.analysis.summary.length > 0, true)
-check('issues merged + capped', Array.isArray(data?.analysis?.commonIssues) && data.analysis.commonIssues.length <= 6, true)
+check('issues capped', Array.isArray(data?.analysis?.commonIssues) && data.analysis.commonIssues.length <= 6, true)
 check('timestamps keep time + note', data?.analysis?.timestamps?.[0]?.time, '4:20')
 check('status preserved', data?.analysis?.status, 'Possibly outdated')
 check('warnings preserved', data?.analysis?.warnings?.length, 1)
 check('conflicts preserved', data?.analysis?.conflictingOpinions?.length, 1)
 check('video thumbnail mapped', data?.video?.thumbnail?.endsWith('hqdefault.jpg'), true)
-check('meta.commentCap', data?.meta?.commentCap, 500)
-check('meta.source', data?.meta?.source, 'gemini')
-check('evidence gap about the 500 cap', data?.analysis?.evidenceGaps?.some((g) => g.includes('V1 limit: 500')), true)
+check('meta.commentCap is the fetch/analysis cap', data?.meta?.commentCap, 500)
+check('meta.source', data?.meta?.source, 'groq')
+check('meta.model is the configured Groq model', data?.meta?.model, config.groq.model)
+check('meta.aiCalls mirrors stats', data?.meta?.aiCalls, data?.stats?.aiCalls)
+check('meta.analysisMode', data?.meta?.analysisMode, 'batched')
+check('evidence gap about the fetch cap', data?.analysis?.evidenceGaps?.some((g) => g.includes('fetch limit: 500')), true)
 check('spam was dropped from the count', data?.stats?.spamOrPromotional > 0, true)
 check('short comments dropped', data?.stats?.droppedTotal > 0, true)
-check('entities decoded before prompting', true, true)
 const ANALYSIS_KEYS = [
   'verdict',
   'doesItWork',
@@ -350,145 +380,166 @@ scenario.commentCount = 0
 scenarioResult = await runAnalyze('bbbbbbbbbbb')
 check('zero comments -> 200', scenarioResult.ok, true)
 check('zero comments -> insufficient evidence', scenarioResult.data?.analysis?.verdict, 'insufficient evidence')
-check('zero comments -> rule based (no Gemini spend)', scenarioResult.data?.meta?.source, 'rule-based')
+check('zero comments -> rule based (no AI spend)', scenarioResult.data?.meta?.source, 'rule-based')
 check('zero comments -> confidence 0', scenarioResult.data?.analysis?.confidence, 0)
 check('zero comments -> says why', scenarioResult.data?.analysis?.summary.includes('Comments are turned off'), true)
 scenario.commentCount = TOTAL_COMMENTS_ON_YOUTUBE
 
-console.log('\n--- scenario: one Gemini batch fails ---')
-scenario.failBatches = new Set([3])
+console.log('\n--- scenario: the first batch extraction fails with a 500 ---')
+scenario.failAnalysisWith = {
+  status: 500,
+  payload: { error: { message: 'Internal error', type: 'server_error', code: 'internal' } },
+}
+calls.attempts = {}
 scenarioResult = await runAnalyze('ccccccccccc')
-check('partial failure still succeeds', scenarioResult.ok, true)
-check('partial failure -> 9 batches analysed', scenarioResult.data?.stats?.batchesAnalyzed, 9)
-check(
-  'partial failure disclosed in evidenceGaps',
-  scenarioResult.data?.analysis?.evidenceGaps?.some((gap) => gap.includes('1 of 10 comment batches')),
-  true
-)
-scenario.failBatches = new Set()
+check('analysis failure -> 502', [scenarioResult.ok, scenarioResult.status], [false, 502])
+check('analysis failure -> GROQ_SERVER_ERROR', scenarioResult.code, 'GROQ_SERVER_ERROR')
+check('analysis failure keeps the root cause', scenarioResult.message.includes('Internal error'), true)
+// A systemic failure on the very first batch surfaces instead of hiding behind
+// a "no data" verdict. The batch extraction policy allows 1 + 4 retries.
+check('analysis failure was retried', calls.attempts.ai, 5)
+scenario.failAnalysisWith = null
 
-console.log('\n--- scenario: every Gemini batch fails ---')
-scenario.failAllGemini = true
-scenarioResult = await runAnalyze('ddddddddddd')
-check('total failure -> 502', [scenarioResult.ok, scenarioResult.status], [false, 502])
-check('total failure -> ALL_BATCHES_FAILED', scenarioResult.code, 'ALL_BATCHES_FAILED')
-check('total failure keeps the root cause', scenarioResult.message.includes('GEMINI_SERVER_ERROR'), true)
-scenario.failAllGemini = false
-
-console.log('\n--- scenario: all batches fail with a bad key (real cause is surfaced) ---')
-scenario.geminiFailure = { status: 401, payload: { error: { status: 'UNAUTHENTICATED', message: 'Request had invalid authentication credentials.' } } }
+console.log('\n--- scenario: analysis fails with a bad key (real cause surfaced) ---')
+scenario.failAnalysisWith = {
+  status: 401,
+  payload: { error: { message: 'Invalid API Key', type: 'invalid_request_error', code: 'invalid_api_key' } },
+}
+calls.attempts = {}
 scenarioResult = await runAnalyze('eeeeeeeeeee')
-check('401 everywhere -> GEMINI_AUTH not a generic code', scenarioResult.code, 'GEMINI_AUTH')
-check('401 everywhere -> root cause in message', scenarioResult.message.includes('UNAUTHENTICATED'), true)
-check('401 everywhere -> root cause in the hint', (scenarioResult.hint || '').length > 0, true)
-scenario.geminiFailure = null
+check('401 -> GROQ_AUTH not a generic code', scenarioResult.code, 'GROQ_AUTH')
+check('401 -> root cause in message', scenarioResult.message.includes('Invalid API Key'), true)
+check('401 -> hint is actionable', (scenarioResult.hint || '').length > 0, true)
+// A 401 is never retried: exactly one attempt.
+check('401 -> one attempt', calls.attempts.ai, 1)
+scenario.failAnalysisWith = null
 
-console.log('\n--- scenario: all batches succeed but the final call runs out of quota ---')
-scenario.failFinal = true
+console.log('\n--- scenario: transient TPM rate limit (billing-URL message) then success ---')
+// Groq's real tokens-per-minute wording ends with a link to the billing page.
+// This MUST be classified as a transient burst (retried), never as a permanent
+// plan-quota block. Fail twice, then the third attempt succeeds.
+scenario.aiFailuresBeforeSuccess = 2
+calls.attempts = {}
 scenarioResult = await runAnalyze('fffffffffff')
-scenario.failFinal = false
-check('final-call failure still returns 200', scenarioResult.ok, true)
-check('source is gemini-partial', scenarioResult.data?.meta?.source, 'gemini-partial')
-check('model is still reported', scenarioResult.data?.meta?.model, config.gemini.model)
-check('a verdict is still produced', typeof scenarioResult.data?.analysis?.verdict, 'string')
-check('verdict is one of the allowed values', ANALYSIS_VERDICTS.includes(scenarioResult.data?.analysis?.verdict), true)
-check('fallback analysis keeps the contract keys', ANALYSIS_KEYS.every((key) => key in (scenarioResult.data?.analysis || {})), true)
-check('fallback confidence is capped', scenarioResult.data?.analysis?.confidence <= 45, true)
-check('fallback says synthesis was unavailable', scenarioResult.data?.analysis?.status.includes('final synthesis unavailable'), true)
-check(
-  'fallback reports the quota cause',
-  scenarioResult.data?.analysis?.evidenceGaps.some((gap) => gap.includes('GEMINI_QUOTA_EXCEEDED')),
-  true
-)
-check(
-  'batched issues survive into the merged result',
-  scenarioResult.data?.analysis?.commonIssues.length > 0,
-  true
-)
-check('not reported as fully Gemini-sourced', scenarioResult.data?.meta?.source === 'gemini', false)
+check('TPM burst retried -> analysis succeeds', scenarioResult.ok, true)
+check('TPM burst was retried twice', calls.attempts.ai, scenarioResult.data?.stats?.aiCalls + 2)
+check('TPM burst -> source groq (no partial fallback needed)', scenarioResult.data?.meta?.source, 'groq')
 
-/* ------------------- Gemini error mapping + retry policy ------------------- */
+console.log('\n--- scenario: plan quota exhausted (never retried, actionable error) ---')
+scenario.failAnalysisWith = {
+  status: 429,
+  payload: {
+    error: {
+      message: 'Rate limit reached. Your plan quota is exhausted. Check billing details at https://console.groq.com.',
+      type: 'rate_limit_error',
+      code: 'rate_limit_exceeded',
+    },
+  },
+}
+calls.attempts = {}
+scenarioResult = await runAnalyze('ggggggggggg')
+check('plan quota -> GROQ_QUOTA_EXCEEDED', scenarioResult.code, 'GROQ_QUOTA_EXCEEDED')
+check('plan quota -> exactly one attempt (never retried)', calls.attempts.ai, 1)
+check('plan quota -> hint says retrying cannot help', (scenarioResult.hint || '').includes('cannot help'), true)
+scenario.failAnalysisWith = null
 
-console.log('\n--- Gemini HTTP error mapping (no generic GEMINI_ERROR) ---')
+/* -------------------- AI error mapping + retry policy -------------------- */
 
-const { mapGeminiError, buildRequestBody } = await import('../src/services/gemini.service.js')
+console.log('\n--- Groq HTTP error mapping (no generic GROQ_ERROR) ---')
 
-function mapped(httpStatus, payload) {
-  return mapGeminiError({
+function mapped(httpStatus, payload, headers = new Map()) {
+  return mapGroqError({
     status: httpStatus,
     payload,
-    model: 'gemini-3.8-flash',
+    model: 'openai/gpt-oss-120b',
     label: 'test',
+    headers,
   })
 }
 
 const originalConsoleError = console.error
-console.error = () => {} // keep the expected [GEMINI ERROR] blocks out of the test log
+console.error = () => {} // keep the expected [GROQ ERROR] blocks out of the test log
 try {
-  const auth = mapped(401, { error: { status: 'UNAUTHENTICATED', message: 'Request had invalid authentication credentials.' } })
-  check('401 -> GEMINI_AUTH', auth.code, 'GEMINI_AUTH')
+  const auth = mapped(401, {
+    error: { message: 'Invalid API Key', type: 'invalid_request_error', code: 'invalid_api_key' },
+  })
+  check('401 -> GROQ_AUTH', auth.code, 'GROQ_AUTH')
   check('401 keeps HTTP status in message', auth.message.includes('HTTP 401'), true)
-  check('401 keeps API status in message', auth.message.includes('UNAUTHENTICATED'), true)
-  check('401 keeps API message', auth.message.includes('invalid authentication credentials'), true)
+  check('401 keeps API type in message', auth.message.includes('invalid_request_error'), true)
+  check('401 keeps API message', auth.message.includes('Invalid API Key'), true)
 
-  const forbidden = mapped(403, { error: { status: 'PERMISSION_DENIED', message: 'The model is not accessible.' } })
-  check('403 -> GEMINI_AUTH', forbidden.code, 'GEMINI_AUTH')
+  const forbidden = mapped(403, { error: { message: 'Forbidden', type: 'permission_error' } })
+  check('403 -> GROQ_AUTH', forbidden.code, 'GROQ_AUTH')
 
   const badRequest = mapped(400, {
-    error: { status: 'INVALID_ARGUMENT', message: 'Unknown name "thinkingConfig" at "generation_config"' },
+    error: { message: 'Unknown parameter: response_format.json_schema', type: 'invalid_request_error' },
   })
-  check('400 -> GEMINI_BAD_REQUEST', badRequest.code, 'GEMINI_BAD_REQUEST')
-  check('400 keeps the real API message', badRequest.message.includes('Unknown name "thinkingConfig"'), true)
+  check('400 -> GROQ_BAD_REQUEST', badRequest.code, 'GROQ_BAD_REQUEST')
+  check('400 keeps the real API message', badRequest.message.includes('response_format.json_schema'), true)
   check('400 hint says do not retry', badRequest.hint.includes('Not transient'), true)
 
-  check('404 -> GEMINI_MODEL', mapped(404, { error: { status: 'NOT_FOUND', message: 'model not found' } }).code, 'GEMINI_MODEL')
-  check(
-    '429 burst limit -> GEMINI_RATE_LIMIT',
-    mapped(429, { error: { status: 'RESOURCE_EXHAUSTED', message: 'Resource has been exhausted (e.g. check quota).' } }).code,
-    'GEMINI_RATE_LIMIT'
-  )
+  // 413 is its own code: the payload is valid, the free-tier token budget
+  // rejected it. The batcher keys off this code to split the batch.
+  const tooLarge = mapped(413, {
+    error: { message: 'Request too large for model `openai/gpt-oss-120b`', type: 'tokens', code: 'rate_limit_exceeded' },
+  })
+  check('413 -> GROQ_REQUEST_TOO_LARGE (distinct from BAD_REQUEST)', tooLarge.code, 'GROQ_REQUEST_TOO_LARGE')
+  check('413 is NOT retryable', RETRYABLE_CODES.has('GROQ_REQUEST_TOO_LARGE'), false)
+  check('413 hint explains the budget', tooLarge.hint.includes('GROQ_REQUEST_TOKEN_BUDGET'), true)
 
-  // Free tier sends a 429 that is a DAILY quota, not a burst limit: retrying
-  // cannot help, so it must get its own code and must not be retried.
+  check('404 -> GROQ_MODEL', mapped(404, { error: { message: 'model not found', type: 'invalid_request_error' } }).code, 'GROQ_MODEL')
+
+  const burst = mapped(429, { error: { message: 'Rate limit reached for model.', type: 'rate_limit_error' } })
+  check('429 burst limit -> GROQ_RATE_LIMIT', burst.code, 'GROQ_RATE_LIMIT')
+
+  // The regression: Groq's real TPM message links to console.groq.com/settings/billing.
+  // "billing" in the text must NOT flip a transient burst into GROQ_QUOTA_EXCEEDED.
+  const tpm = mapped(429, { error: TPM_RATE_LIMIT }, new Map([['retry-after', '10']]))
+  check('TPM 429 (billing-URL wording) -> GROQ_RATE_LIMIT, not quota', tpm.code, 'GROQ_RATE_LIMIT')
+  check('TPM 429 is retryable', RETRYABLE_CODES.has(tpm.code), true)
+  check('TPM 429 carries the retry-after window', tpm.retryAfterMs, 10000)
+
+  // A plan/credits limit is not a burst limit: retrying cannot help, so it must
+  // get its own code and must not be retried - even though it also links to billing.
   const quota = mapped(429, {
     error: {
-      status: 'RESOURCE_EXHAUSTED',
-      message:
-        'You exceeded your current quota, please check your plan and billing details.\n' +
-        '* Quota exceeded for metric: generativelanguage.googleapis.com/generate_content_free_tier_requests, limit: 20, model: gemini-3.8-flash\n' +
-        'Please retry in 6h57m59.131205188s.',
+      message: 'Rate limit reached. Your plan quota is exhausted. Check billing details at https://console.groq.com.',
+      type: 'rate_limit_error',
+      code: 'rate_limit_exceeded',
     },
   })
-  check('daily quota 429 -> GEMINI_QUOTA_EXCEEDED', quota.code, 'GEMINI_QUOTA_EXCEEDED')
-  check('quota message keeps the API text', quota.message.includes('limit: 20'), true)
+  check('plan quota 429 -> GROQ_QUOTA_EXCEEDED', quota.code, 'GROQ_QUOTA_EXCEEDED')
+  check('quota message keeps the API text', quota.message.includes('plan quota is exhausted'), true)
   check('quota hint says retrying cannot help', quota.hint.includes('cannot help'), true)
-  check('quota hint reports the reset time', quota.hint.includes('6h 57m'), true)
-  check('daily quota is NOT retryable', RETRYABLE_CODES.has('GEMINI_QUOTA_EXCEEDED'), false)
+  check('plan quota is NOT retryable', RETRYABLE_CODES.has('GROQ_QUOTA_EXCEEDED'), false)
 
-  check('500 -> GEMINI_SERVER_ERROR', mapped(500, { error: { status: 'INTERNAL', message: 'boom' } }).code, 'GEMINI_SERVER_ERROR')
-  check('418 -> still specific, not swallowed', mapped(418, { error: { message: 'teapot' } }).code, 'GEMINI_ERROR')
+  check('500 -> GROQ_SERVER_ERROR', mapped(500, { error: { message: 'boom', type: 'server_error' } }).code, 'GROQ_SERVER_ERROR')
+  check('418 -> still specific, not swallowed', mapped(418, { error: { message: 'teapot' } }).code, 'GROQ_ERROR')
   check('418 keeps its message', mapped(418, { error: { message: 'teapot' } }).message.includes('HTTP 418'), true)
 } finally {
   console.error = originalConsoleError
 }
 
 console.log('\n--- 4xx is never retried, 429/5xx is retried ---')
-check('GEMINI_BAD_REQUEST not retryable', RETRYABLE_CODES.has('GEMINI_BAD_REQUEST'), false)
-check('GEMINI_AUTH not retryable', RETRYABLE_CODES.has('GEMINI_AUTH'), false)
-check('GEMINI_MODEL not retryable', RETRYABLE_CODES.has('GEMINI_MODEL'), false)
-check('GEMINI_MALFORMED not retryable', RETRYABLE_CODES.has('GEMINI_MALFORMED'), false)
-check('GEMINI_RATE_LIMIT retryable', RETRYABLE_CODES.has('GEMINI_RATE_LIMIT'), true)
-check('GEMINI_SERVER_ERROR retryable', RETRYABLE_CODES.has('GEMINI_SERVER_ERROR'), true)
-check('GEMINI_NETWORK retryable', RETRYABLE_CODES.has('GEMINI_NETWORK'), true)
-check('GEMINI_OVERLOADED retryable', RETRYABLE_CODES.has('GEMINI_OVERLOADED'), true)
+check('GROQ_BAD_REQUEST not retryable', RETRYABLE_CODES.has('GROQ_BAD_REQUEST'), false)
+check('GROQ_AUTH not retryable', RETRYABLE_CODES.has('GROQ_AUTH'), false)
+check('GROQ_MODEL not retryable', RETRYABLE_CODES.has('GROQ_MODEL'), false)
+check('GROQ_MALFORMED not retryable', RETRYABLE_CODES.has('GROQ_MALFORMED'), false)
+check('GROQ_EMPTY not retryable', RETRYABLE_CODES.has('GROQ_EMPTY'), false)
+check('GROQ_QUOTA_EXCEEDED not retryable', RETRYABLE_CODES.has('GROQ_QUOTA_EXCEEDED'), false)
+check('GROQ_RATE_LIMIT retryable', RETRYABLE_CODES.has('GROQ_RATE_LIMIT'), true)
+check('GROQ_SERVER_ERROR retryable', RETRYABLE_CODES.has('GROQ_SERVER_ERROR'), true)
+check('GROQ_NETWORK retryable', RETRYABLE_CODES.has('GROQ_NETWORK'), true)
+check('GROQ_TIMEOUT retryable', RETRYABLE_CODES.has('GROQ_TIMEOUT'), true)
+check('GROQ_OVERLOADED retryable', RETRYABLE_CODES.has('GROQ_OVERLOADED'), true)
 check(
   'overload waits longer than the default backoff',
-  PATIENCE_OVERRIDES.GEMINI_OVERLOADED.baseDelayMs > 1000,
+  PATIENCE_OVERRIDES.GROQ_OVERLOADED.baseDelayMs > 1000,
   true
 )
 check(
   'overload gets more attempts than the default policy',
-  PATIENCE_OVERRIDES.GEMINI_OVERLOADED.retries > 2,
+  PATIENCE_OVERRIDES.GROQ_OVERLOADED.retries > 2,
   true
 )
 check(
@@ -497,31 +548,69 @@ check(
   true
 )
 
-console.log('\n--- 503 UNAVAILABLE / "high demand" is transient, not a config error ---')
-const overload = mapped(503, {
-  error: { status: 'UNAVAILABLE', message: 'This model is currently experiencing high demand.' },
-})
-check('503 UNAVAILABLE -> GEMINI_OVERLOADED', overload.code, 'GEMINI_OVERLOADED')
-check('503 UNAVAILABLE keeps the API message', overload.message.includes('high demand'), true)
-check('503 UNAVAILABLE is not mistaken for auth', overload.code !== 'GEMINI_AUTH', true)
+console.log('\n--- 503 / "overloaded" is transient, not a config error ---')
+const overload = mapped(503, { error: { message: 'Service temporarily overloaded, try again later.', type: 'server_error' } })
+check('503 overloaded -> GROQ_OVERLOADED', overload.code, 'GROQ_OVERLOADED')
+check('503 overloaded keeps the API message', overload.message.includes('temporarily overloaded'), true)
+check('503 overloaded is not mistaken for auth', overload.code !== 'GROQ_AUTH', true)
 check(
-  'high-demand wording is recognised even with a different status',
-  mapped(429 + 100, { error: { message: 'high demand, please try again later' } }).code,
-  'GEMINI_OVERLOADED'
+  'overload wording is recognised even with a different status',
+  mapped(502, { error: { message: 'overloaded, please try again later' } }).code,
+  'GROQ_OVERLOADED'
 )
 
-/** Counts real fetch attempts for one analyseBatch call. */
+console.log('\n--- request body is Groq/OpenAI-shaped and the schema is valid JSON Schema ---')
+const groqBody = buildRequestBody({
+  system: 'sys',
+  prompt: 'usr',
+  schemaName: 'skipthescroll_verdict',
+  schema: FINAL_SCHEMA,
+  maxTokens: 4096,
+})
+check('body has model', groqBody.model, config.groq.model)
+check('body uses chat messages', Array.isArray(groqBody.messages) && groqBody.messages.length, 2)
+check('first message is the system prompt', groqBody.messages[0].role, 'system')
+check('second message is the user prompt', groqBody.messages[1].role, 'user')
+check('body is not streamed', groqBody.stream, false)
+check('body sends max_tokens', groqBody.max_tokens, 4096)
+check('gpt-oss gets reasoning_effort low', groqBody.reasoning_effort, 'low')
+check('body asks for json_schema first', groqBody.response_format.type, 'json_schema')
+check('schema is namespaced', groqBody.response_format.json_schema.name, 'skipthescroll_verdict')
+const lowered = groqBody.response_format.json_schema.schema
+check('schema types lowercased for Groq', lowered.type, 'object')
+check('nested array types lowercased', lowered.properties.commonIssues.items.type, 'object')
+check('no uppercase type survives the conversion', JSON.stringify(lowered).match(/"(OBJECT|STRING|ARRAY|INTEGER|BOOLEAN)"/), null)
+check('required list preserved', lowered.required.includes('verdict'), true)
+
+setJsonSchemaSupported(false)
+const downgraded = buildRequestBody({ system: 's', prompt: 'u', schemaName: 'x', schema: FINAL_SCHEMA })
+check('falls back to json_object when unsupported', downgraded.response_format.type, 'json_object')
+check('supportsJsonSchema reflects the downgrade', supportsJsonSchema(), false)
+setJsonSchemaSupported(true)
+
+console.log('\n--- toJsonSchema handles nesting ---')
+check('top-level type', toJsonSchema({ type: 'ARRAY', items: { type: 'STRING' } }).type, 'array')
+check('nested item type', toJsonSchema({ type: 'ARRAY', items: { type: 'STRING' } }).items.type, 'string')
+check('passes through description', toJsonSchema({ type: 'STRING', description: 'x' }).description, 'x')
+check('maps arrays of schemas', toJsonSchema([{ type: 'STRING' }])[0].type, 'string')
+
+console.log('\n--- redact removes the key from anything that gets logged ---')
+check('full key redacted', redact('failed with ' + config.groq.apiKey).includes(config.groq.apiKey), false)
+check('redaction is visible', redact('failed with ' + config.groq.apiKey).includes('[REDACTED_API_KEY]'), true)
+check('truncated key prefix redacted', redact('echoed ' + config.groq.apiKey.slice(0, 6)).includes(config.groq.apiKey.slice(0, 6)), false)
+check('ordinary text untouched', redact('model not found'), 'model not found')
+
+/** Counts real fetch attempts for one analyzeAllAtOnce call. */
 async function attemptCountFor(status, payload) {
-  scenario.geminiFailure = { status, payload }
+  scenario.failAnalysisWith = { status, payload }
   calls.attempts = {}
-  await analyzeBatch({
+  await analyzeAllAtOnce({
     video: { title: 't', channel: 'c', publishedAt: null, duration: null, commentCount: 10 },
     comments: [{ author: 'a', text: 'it worked for me thanks', likes: 1, publishedAt: null, replies: [], flags: {} }],
-    batchIndex: 0,
-    batchCount: 1,
+    stats: { commentsAnalyzed: 1 },
   }).catch(() => {})
   const total = Object.values(calls.attempts).reduce((a, b) => a + b, 0)
-  scenario.geminiFailure = null
+  scenario.failAnalysisWith = null
   return total
 }
 
@@ -530,111 +619,137 @@ console.error = () => {}
 const originalWarn = console.warn
 console.warn = () => {}
 try {
-  check('400 attempted exactly once (no retry)', await attemptCountFor(400, { error: { status: 'INVALID_ARGUMENT', message: 'bad field' } }), 1)
-  check('401 attempted exactly once (no retry)', await attemptCountFor(401, { error: { status: 'UNAUTHENTICATED', message: 'bad key' } }), 1)
-  check('403 attempted exactly once (no retry)', await attemptCountFor(403, { error: { status: 'PERMISSION_DENIED', message: 'nope' } }), 1)
-  check('404 attempted exactly once (no retry)', await attemptCountFor(404, { error: { status: 'NOT_FOUND', message: 'no model' } }), 1)
+  check('400 attempted exactly once (no retry)', await attemptCountFor(400, { error: { message: 'bad field', type: 'invalid_request_error' } }), 1)
+  check('401 attempted exactly once (no retry)', await attemptCountFor(401, { error: { message: 'bad key', type: 'invalid_request_error' } }), 1)
+  check('403 attempted exactly once (no retry)', await attemptCountFor(403, { error: { message: 'nope', type: 'permission_error' } }), 1)
+  check('404 attempted exactly once (no retry)', await attemptCountFor(404, { error: { message: 'no model', type: 'invalid_request_error' } }), 1)
   // 1 initial attempt + 2 retries
-  check('500 attempted 3 times (retried)', await attemptCountFor(500, { error: { status: 'INTERNAL', message: 'boom' } }), 3)
-  check('429 attempted 3 times (retried)', await attemptCountFor(429, { error: { status: 'RESOURCE_EXHAUSTED', message: 'slow down' } }), 3)
+  check('500 attempted 3 times (retried)', await attemptCountFor(500, { error: { message: 'boom', type: 'server_error' } }), 3)
+  check('429 burst attempted 3 times (retried)', await attemptCountFor(429, { error: { message: 'Rate limit reached for model.', type: 'rate_limit_error' } }), 3)
+  // A plan quota is not a burst limit: exactly one attempt, no wasted time.
+  check(
+    '429 quota attempted exactly once (never retried)',
+    await attemptCountFor(429, { error: { message: 'Rate limit reached. Your plan quota is exhausted.', type: 'rate_limit_error' } }),
+    1
+  )
 } finally {
   console.error = originalConsoleError2
   console.warn = originalWarn
 }
 
-console.log('\n--- deterministic fallback when the final synthesis call fails ---')
-const sampleBatches = [
-  {
-    successPatterns: ['it worked first try'],
-    failurePatterns: [],
-    commonIssues: [{ issue: 'needs a restart', mentions: 4 }],
-    helpfulFixes: [{ fix: 'reboot the router', mentions: 3 }],
-    timestamps: [{ time: '2:10', note: 'here it worked' }],
-    warnings: [],
-    conflictingExperiences: [],
-    evidenceGaps: [],
-  },
-  {
-    successPatterns: [],
-    failurePatterns: ['never connected'],
-    commonIssues: [{ issue: 'needs a restart', mentions: 2 }, { issue: 'slow speeds', mentions: 1 }],
-    helpfulFixes: [{ fix: 'reboot the router', mentions: 1 }],
-    timestamps: [{ time: '5:40', note: 'failed here' }],
-    warnings: [],
-    conflictingExperiences: ['works for me, not for my neighbour'],
-    evidenceGaps: [],
-  },
-]
+console.log('\n--- batch packing, rate-limit pacing and prompt merging ---')
+check('parseDuration seconds', parseDuration('30s'), 30000)
+check('parseDuration bare seconds', parseDuration('30'), 30000)
+check('parseDuration minutes', parseDuration('1m'), 60000)
+check('parseDuration millis', parseDuration('500ms'), 500)
+check('parseDuration ISO', parseDuration('PT45S'), 45000)
+check('parseDuration junk', parseDuration('soon'), null)
 
-const merged = buildMergedAnalysis({
-  batches: sampleBatches,
-  stats: { commentsAnalyzed: 100 },
-  cause: { code: 'GEMINI_QUOTA_EXCEEDED', message: 'quota exhausted' },
-})
-check('fallback keeps the analysis contract keys', ANALYSIS_KEYS.every((key) => key in merged), true)
-check('fallback verdict is from the tally', merged.verdict, 'mixed results')
-check('fallback merges duplicate issues', merged.commonIssues[0].issue, 'needs a restart')
-check('fallback sums mentions across batches', merged.commonIssues[0].mentions, 6)
-check('fallback merges fixes too', merged.helpfulFixes[0].fix, 'reboot the router')
-check('fallback keeps timestamps', merged.timestamps.length, 2)
-check('fallback carries conflicts through', merged.conflictingOpinions.length, 1)
-check('fallback confidence stays modest', merged.confidence <= 45, true)
-check('fallback states the cause in the reason', merged.confidenceReason.includes('GEMINI_QUOTA_EXCEEDED'), true)
-check('fallback says the synthesis was skipped', merged.status.includes('final synthesis unavailable'), true)
-check('fallback records an evidence gap', merged.evidenceGaps.some((gap) => gap.includes('did not complete')), true)
-
-const allSuccess = buildMergedAnalysis({
-  batches: [
-    { successPatterns: ['a'], failurePatterns: [], commonIssues: [], helpfulFixes: [], timestamps: [], warnings: [], conflictingExperiences: [] },
-    { successPatterns: ['b'], failurePatterns: [], commonIssues: [], helpfulFixes: [], timestamps: [], warnings: [], conflictingExperiences: [] },
-  ],
-  stats: { commentsAnalyzed: 100 },
-  cause: { code: 'GEMINI_OVERLOADED', message: 'busy' },
-})
-check('fallback: unanimous success -> works', allSuccess.verdict, 'works')
-
-const allFailure = buildMergedAnalysis({
-  batches: [
-    { successPatterns: [], failurePatterns: ['a'], commonIssues: [], helpfulFixes: [], timestamps: [], warnings: [], conflictingExperiences: [] },
-    { successPatterns: [], failurePatterns: ['b'], commonIssues: [], helpfulFixes: [], timestamps: [], warnings: [], conflictingExperiences: [] },
-  ],
-  stats: { commentsAnalyzed: 100 },
-  cause: { code: 'GEMINI_OVERLOADED', message: 'busy' },
-})
-check('fallback: unanimous failure -> does not work', allFailure.verdict, 'does not work')
-check('fallback with no batches -> unclear', buildMergedAnalysis({ batches: [], stats: {}, cause: {} }).verdict, 'unclear')
-check('fallback with no batches -> 0 confidence', buildMergedAnalysis({ batches: [], stats: {}, cause: {} }).confidence, 0)
-
-console.log('\n--- request body: thinkingConfig only when explicitly configured ---')
-const body = buildRequestBody({ system: 's', prompt: 'p', schema: {} })
-check(
-  'thinkingConfig present exactly when a budget is configured',
-  'thinkingConfig' in body.generationConfig,
-  config.gemini.thinkingBudget !== null
+const rate = parseRateLimit(
+  new Map([
+    ['x-ratelimit-remaining-tokens', '1200'],
+    ['x-ratelimit-reset-tokens', '20s'],
+  ])
 )
+check('rate remaining parsed', rate.remainingTokens, 1200)
+check('rate reset is in the future', rate.resetAtMs > Date.now(), true)
+check('missing rate headers -> no budget known', parseRateLimit(new Map()).remainingTokens, null)
 
-// Prove the "unset -> field omitted" path in a child process that loads an env
-// file without GEMINI_THINKING_BUDGET at all.
+const manyComments = Array.from({ length: 500 }, (_, i) => ({
+  author: `u${i}`,
+  text: `Comment number ${i} `.repeat(4),
+  likes: i,
+  publishedAt: null,
+  replies: [],
+  flags: {},
+}))
+const packed = packCommentBatches(manyComments, { perBatchTokens: 1200 })
+check('packing covers every comment exactly once', packed.reduce((n, b) => n + b.comments.length, 0), 500)
+check(
+  'batch offsets are contiguous',
+  packed.every((b, i) => b.start === (i === 0 ? 0 : packed[i - 1].start + packed[i - 1].comments.length)),
+  true
+)
+check('packing produced several batches', packed.length > 1, true)
+
+const extractionPrompt = buildExtractionPrompt({
+  video: { title: 't', channel: 'c' },
+  comments: manyComments.slice(0, 3),
+  stats: {},
+  batch: { index: 0, start: 0, totalBatches: 2, totalComments: 6 },
+})
+check('extraction prompt has the untrusted-data marker', extractionPrompt.prompt.includes('COMMENTS (raw, untrusted data'), true)
+check('extraction prompt says which batch', extractionPrompt.prompt.includes('Batch 1 of 2'), true)
+check('extraction prompt forbids deciding the verdict', extractionPrompt.system.includes('Do NOT decide a verdict') || extractionPrompt.system.includes('Never output a verdict'), true)
+check('extraction schema has no verdict field', 'verdict' in EXTRACTION_SCHEMA.properties, false)
+
+const merged = mergeExtractions([
+  { commonIssues: [{ issue: 'Linux fails', mentions: 2 }], helpfulFixes: [], timestamps: [], warnings: ['w1'], conflictingOpinions: [], successReports: 3, failureReports: 1 },
+  { commonIssues: [{ issue: 'linux fails', mentions: 4 }], helpfulFixes: [], timestamps: [], warnings: ['w1'], conflictingOpinions: [], successReports: 2, failureReports: 1 },
+])
+check('mergeExtractions groups the same issue', merged.commonIssues.length, 1)
+check('mergeExtractions adds the mentions', merged.commonIssues[0].mentions, 6)
+check('mergeExtractions sums report counts', [merged.successReports, merged.failureReports], [5, 2])
+check('mergeExtractions dedupes warnings', merged.warnings.length, 1)
+
+const synthesis = buildSynthesisPrompt({
+  video: { title: 't', channel: 'c' },
+  stats: {},
+  batches: [normalizeExtraction({ commonIssues: [{ issue: 'x' }], helpfulFixes: [], warnings: [], successReports: 1, failureReports: 0 })],
+  grounding: manyComments.slice(0, 2),
+  batchInfo: { requested: 3 },
+})
+check('synthesis prompt carries merged extractions', synthesis.prompt.includes('MERGED BATCH EXTRACTIONS'), true)
+check('synthesis prompt grounds in real quotes', synthesis.prompt.includes('FIRST-HAND EXAMPLES'), true)
+
+console.log('\n--- the API key never appears in anything the extension can see ---')
+check('config key is only in the server env', typeof config.groq.apiKey, 'string')
+check('health payload exposes no raw key', JSON.stringify(safeHealthShape()).includes(config.groq.apiKey), false)
+check('request body carries no key', JSON.stringify(groqBody).includes(config.groq.apiKey), false)
+
+// Prove the key is sent as an Authorization header (not a URL query param) in a
+// child process that loads a known key from a temp env file.
 const tempEnv = path.join(os.tmpdir(), `skipthescroll-test-${Date.now()}.env`)
-fs.writeFileSync(tempEnv, 'YOUTUBE_API_KEY=test\nGEMINI_API_KEY=test\nGEMINI_MODEL=gemini-3.8-flash\n')
+fs.writeFileSync(tempEnv, 'YOUTUBE_API_KEY=test-youtube-key\nGROQ_API_KEY=groq-test-key-0123456789abcd\n')
+
+/**
+ * dotenv never overrides an already-set variable, so the test's own
+ * GROQ_API_KEY has to be stripped for the temp env file to win in the child.
+ */
+function childEnv() {
+  const env = { ...process.env, ENV_FILE: tempEnv }
+  delete env.GROQ_API_KEY
+  delete env.GROQ_MODEL
+  return env
+}
 const child = spawnSync(
   process.execPath,
   [
     '--input-type=module',
     '-e',
-    `const { buildRequestBody } = await import(${JSON.stringify(
-      pathToFileURL(path.resolve('src/services/gemini.service.js')).href
+    `const { config } = await import(${JSON.stringify(
+      pathToFileURL(path.resolve('src/config/env.js')).href
     )});
-     const { config } = await import(${JSON.stringify(
-       pathToFileURL(path.resolve('src/config/env.js')).href
+     globalThis.fetch = async (url, options = {}) => {
+       process.stdout.write(JSON.stringify({
+         url: String(url),
+         auth: options?.headers?.authorization || null,
+         model: config.groq.model,
+         bodyReasoningEffort: JSON.parse(options?.body || '{}').reasoning_effort,
+         maxTokens: JSON.parse(options?.body || '{}').max_tokens,
+       }));
+       return { ok: true, status: 200, headers: new Map(), json: async () => ({ choices: [{ finish_reason: 'stop', message: { content: '{"verdict":"works","confidence":50,"summary":"s","commonIssues":[],"helpfulFixes":[],"warnings":[]}' } }] }) };
+     };
+     const { analyzeAllAtOnce } = await import(${JSON.stringify(
+       pathToFileURL(path.resolve('src/services/groq.service.js')).href
      )});
-     process.stdout.write(JSON.stringify({
-       budget: config.gemini.thinkingBudget,
-       hasThinkingConfig: 'thinkingConfig' in buildRequestBody({ system: 's', prompt: 'p', schema: {} }).generationConfig,
-       version: config.gemini.apiVersion,
-     }));`,
+     await analyzeAllAtOnce({
+       video: { title: 't', channel: 'c', publishedAt: null, duration: null, commentCount: 1 },
+       comments: [{ author: 'a', text: 'worked for me', likes: 1, publishedAt: null, replies: [], flags: {} }],
+       stats: { commentsAnalyzed: 1 },
+     }).catch(() => {});`,
   ],
-  { env: { ...process.env, ENV_FILE: tempEnv, GEMINI_THINKING_BUDGET: '' }, encoding: 'utf8' }
+  { env: childEnv(), encoding: 'utf8' }
 )
 fs.unlinkSync(tempEnv)
 let childResult = {}
@@ -643,10 +758,20 @@ try {
 } catch {
   /* reported below */
 }
-check('no budget in env file -> thinkingBudget is null', childResult.budget, null)
-check('no budget in env file -> thinkingConfig omitted', childResult.hasThinkingConfig, false)
-check('child process apiVersion keeps the v', childResult.version, 'v1beta')
-check('endpoint keeps the v in v1beta', (await import('../src/services/gemini.service.js')).endpointFor('gemini-3.8-flash').includes('/v1beta/models/'), true)
+check('endpoint is the Groq OpenAI-compatible URL', childResult.url, 'https://api.groq.com/openai/v1/chat/completions')
+check('key travels in the Authorization header', childResult.auth, 'Bearer groq-test-key-0123456789abcd')
+check('key is never a query parameter', (childResult.url || '').includes('key='), false)
+check('default model is openai/gpt-oss-120b', childResult.model, 'openai/gpt-oss-120b')
+check('reasoning_effort=low goes over the wire', childResult.bodyReasoningEffort, 'low')
+check('default max_tokens is 3072 (fits the 8k budget)', childResult.maxTokens, 3072)
+
+/** Mirrors the /api/health payload shape for a leak check. */
+function safeHealthShape() {
+  return {
+    model: config.groq.model,
+    keys: { youtube: `sha256:${config.youtube.fingerprint}`, groq: `sha256:${config.groq.fingerprint}` },
+  }
+}
 
 console.log(`\npipeline finished in ${elapsed}ms`)
 console.log(failed === 0 ? '\nALL PIPELINE CHECKS PASSED' : `\n${failed} CHECK(S) FAILED`)

@@ -9,35 +9,37 @@ const rawBase =
 
 export const API_BASE_URL = String(rawBase).replace(/\/+$/, '')
 
-/** Hard V1 limit, mirrored from the server so the UI can explain itself. */
+/** Hard cap mirrored from the server: comment threads fetched and analysed. */
 export const MAX_COMMENTS = 500
 
 export const VIDEO_INFO_TIMEOUT_MS = 20_000
-export const ANALYSIS_TIMEOUT_MS = 180_000
+/** Large comment sections are analysed in paced AI batches, which can take a
+ *  few minutes on the free tier. The server always answers within this window. */
+export const ANALYSIS_TIMEOUT_MS = 600_000
 
 /** Progress copy shown while the server works. */
 export const STAGES = [
   {
     key: 'fetch',
     label: 'Fetching comments...',
-    hint: 'Pulling up to 500 top comments from YouTube.',
+    hint: 'Pulling every comment thread YouTube returns, not just the top few.',
   },
   {
     key: 'analyze',
     label: 'Analyzing community feedback...',
-    hint: 'Looking for repeated patterns across comments, not one-liners.',
+    hint: 'Reading every comment; big sections are analysed in paced batches.',
   },
   {
     key: 'verdict',
     label: 'Generating verdict...',
-    hint: 'Combining batch insights into a single community verdict.',
+    hint: 'Weighing every comment pattern into one community verdict.',
   },
 ]
 
 export const STAGE_INTERVAL_MS = 3500
 
 export const LOADING_TIP =
-  'Tip: the whole analysis runs on your local SkipTheScroll server. First run can take 30-60 seconds.'
+  'Tip: the whole analysis runs on your local SkipTheScroll server. Every fetched comment is analysed - large comment sections can take a couple of minutes.'
 
 /** Tailwind class sets. Written out in full so Tailwind keeps them. */
 export const VERDICT_TONES = {

@@ -1,3 +1,5 @@
+import { MAX_COMMENTS } from '../lib/constants.js'
+
 export default function AnalyzeButton({ onClick, disabled = false, loading = false, label = 'Analyze Comments' }) {
   return (
     <div className="bg-white px-4 pb-4 pt-3">
@@ -26,7 +28,7 @@ export default function AnalyzeButton({ onClick, disabled = false, loading = fal
         )}
       </button>
       <p className="mt-1.5 text-center text-[10px] text-slate-400">
-        Reads up to 500 comments. Runs on your own local server.
+        Reads every comment (up to {MAX_COMMENTS}). Runs on your own local server.
       </p>
     </div>
   )

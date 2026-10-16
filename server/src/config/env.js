@@ -35,24 +35,8 @@ function optionalInt(name, fallback, { min, max } = {}) {
   return value
 }
 
-/**
- * Thinking budget is optional on purpose: some models (Gemini 3.x) reject
- * `thinkingBudget: 0`, so when it is not set we send no thinkingConfig at all
- * and let the model use its own default.
- *
- * Accepted values: "" | auto | none | unset  -> null (field omitted)
- *                  a number (e.g. 0, 1024, -1)
- */
-function optionalThinkingBudget(name = 'GEMINI_THINKING_BUDGET') {
-  const raw = (process.env[name] || '').trim().toLowerCase()
-  if (raw === '' || raw === 'auto' || raw === 'none' || raw === 'unset' || raw === 'default') return null
-  const parsed = Number.parseInt(raw, 10)
-  if (!Number.isFinite(parsed)) return null
-  return parsed >= 0 ? parsed : -1
-}
-
 const youtubeApiKey = required('YOUTUBE_API_KEY', 'missing')
-const geminiApiKey = required('GEMINI_API_KEY', 'missing')
+const groqApiKey = required('GROQ_API_KEY', 'missing')
 
 if (missing.length) {
   throw new Error(
@@ -85,7 +69,7 @@ function fingerprint(secret) {
  *   - a value far too short to be a real key
  *
  * Anything else is accepted: whether the key actually works is decided by the
- * API, and `npm run check:gemini` reports that authoritatively.
+ * API, and `npm run check:groq` reports that authoritatively.
  */
 export function inspectKey(label, secret, variableName = '') {
   const value = String(secret ?? '')
@@ -123,22 +107,34 @@ export const config = {
     timeoutMs: optionalInt('YOUTUBE_TIMEOUT_MS', 15_000, { min: 1_000 }),
   },
 
-  gemini: {
-    apiKey: geminiApiKey,
-    ...inspectKey('GEMINI_API_KEY', geminiApiKey, 'GEMINI_API_KEY'),
-    model: (process.env.GEMINI_MODEL || 'gemini-3.8-flash').trim(),
-    // Accepts "v1beta", "1beta" or "v1" and always yields "v1beta" / "v1".
-    apiVersion: (process.env.GEMINI_API_VERSION || 'v1beta').trim().replace(/^(\d)/, 'v$1'),
-    thinkingBudget: optionalThinkingBudget(),
-    batchSize: optionalInt('GEMINI_BATCH_SIZE', 50, { min: 10, max: 200 }),
-    concurrency: optionalInt('GEMINI_CONCURRENCY', 3, { min: 1, max: 8 }),
-    timeoutMs: optionalInt('GEMINI_TIMEOUT_MS', 120_000, { min: 5_000 }),
+  /**
+   * Groq (OpenAI-compatible chat completions). The key stays on the server and
+   * is only ever sent as an Authorization: Bearer header.
+   */
+  groq: {
+    apiKey: groqApiKey,
+    ...inspectKey('GROQ_API_KEY', groqApiKey, 'GROQ_API_KEY'),
+    model: (process.env.GROQ_MODEL || 'openai/gpt-oss-120b').trim(),
+    // gpt-oss spends part of this budget on reasoning, so 3072 keeps the
+    // request's pre-flight estimate under the free tier's ~8k tokens/minute
+    // wall (larger values re-trigger HTTP 413).
+    maxTokens: optionalInt('GROQ_MAX_TOKENS', 3072, { min: 512 }),
+    // Groq's free tier rejects a request whose estimate (prompt + max_tokens)
+    // exceeds ~8000 tokens with HTTP 413 before the model runs, and only
+    // allows ~8k tokens PER MINUTE in total. Big comment sections are analysed
+    // in paced batches sized against this budget (see groq.service.js).
+    requestTokenBudget: optionalInt('GROQ_REQUEST_TOKEN_BUDGET', 8000, { min: 2000 }),
+    timeoutMs: optionalInt('GROQ_TIMEOUT_MS', 120_000, { min: 5_000 }),
     // Probe the configured model at startup so problems surface before a user
-    // clicks "Analyze Comments". Set GEMINI_STARTUP_CHECK=false to disable.
-    startupCheck: (process.env.GEMINI_STARTUP_CHECK || 'true').trim().toLowerCase() !== 'false',
+    // clicks "Analyze Comments". Set GROQ_STARTUP_CHECK=false to disable.
+    startupCheck: (process.env.GROQ_STARTUP_CHECK || 'true').trim().toLowerCase() !== 'false',
   },
 
-  // V1 hard limit: never analyse more than 500 comments, whatever the env says.
+  // How many top-level comment threads are fetched from YouTube AND analysed.
+  // commentThreads.list is paginated (100 per page) and stops as soon as this
+  // many threads are collected. This is NOT limited by the AI budget anymore:
+  // whatever does not fit one request is split into paced batches by
+  // groq.service.js, so the default covers the vast majority of videos.
   comments: {
     max: optionalInt('MAX_COMMENTS', 500, { min: 1, max: 500 }),
     pageSize: 100,

@@ -6,7 +6,7 @@ import {
 
 /**
  * The extension only ever talks to its own local backend.
- * API keys for YouTube and Gemini live exclusively in the backend .env file.
+ * API keys for YouTube and Groq live exclusively in the backend .env file.
  */
 
 class ApiError extends Error {

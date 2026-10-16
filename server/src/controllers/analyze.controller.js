@@ -2,9 +2,8 @@ import { config } from '../config/env.js'
 import { ApiError } from '../utils/ApiError.js'
 import { validateVideoId } from '../utils/validateVideoId.js'
 import { cleanComments } from '../utils/cleanComments.js'
-import { chunk, mapWithConcurrency } from '../utils/arrays.js'
 import { getVideoMetadata, fetchComments, getVideoSummary } from '../services/youtube.service.js'
-import { analyzeBatch, synthesizeFinalAnalysis } from '../services/gemini.service.js'
+import { analyzeComments } from '../services/groq.service.js'
 
 const SUCCESS_RE =
   /\b(work(?:ed|ing)?(?:s|ed)? (?:for me|out|perfectly|great|now)|did ?n'?t have to|successfully|solved (?:it|my)|fixed (?:it|my|this)|this (?:video|tutorial|guide|method|fix) (?:worked|is the|helped)|thank you (?:so much|for the fix)|confirmed working|can confirm)\b/i
@@ -38,7 +37,15 @@ function writeCache(videoId, data) {
 
 /* --------------------------------- helpers --------------------------------- */
 
-function buildStats({ video, comments, cleanStats, threadsFetched, batchesAnalyzed, batchesRequested }) {
+function buildStats({
+  video,
+  comments,
+  cleanStats,
+  threadsFetched,
+  batchesAnalyzed,
+  batchesRequested,
+  fetchTruncated = false,
+}) {
   let successSignals = 0
   let failureSignals = 0
   let replyComments = 0
@@ -64,9 +71,11 @@ function buildStats({ video, comments, cleanStats, threadsFetched, batchesAnalyz
     commentCountOnYouTube: video.commentCount ?? 0,
     threadsFetched,
     commentsAnalyzed: comments.length,
+    repliesAnalyzed: replyComments,
     droppedTotal: cleanStats.dropped + cleanStats.duplicates + cleanStats.spam,
     duplicates: cleanStats.duplicates,
     spamOrPromotional: cleanStats.spam,
+    tooShortOrEmpty: cleanStats.dropped,
     maxLikes: cleanStats.maxLikes,
     withReplies: cleanStats.withReplies,
     replyComments,
@@ -76,13 +85,20 @@ function buildStats({ video, comments, cleanStats, threadsFetched, batchesAnalyz
     newestCommentAt,
     batchesAnalyzed,
     batchesRequested,
-    truncated: Boolean(video.commentCount && video.commentCount > comments.length),
-    batchSize: config.gemini.batchSize,
+    batchSize: comments.length,
+    fetchLimit: config.comments.max,
+    // Only true when YouTube had MORE threads than the fetch cap allowed. It is
+    // NOT set just because YouTube's comment count includes replies or because
+    // short/spam comments were dropped - those are reported separately.
+    truncated: fetchTruncated,
+    failedBatches: 0,
+    aiCalls: 0,
+    analysisMode: batchesAnalyzed === 1 ? 'single-pass' : null,
   }
 }
 
 /**
- * Rule-based fallback used when there is nothing worth sending to Gemini
+ * Rule-based fallback used when there is nothing worth sending to the AI
  * (no comments / all spam). Never invents a conclusion.
  */
 function buildInsufficientAnalysis(stats, reason, verdict = 'insufficient evidence') {
@@ -137,7 +153,7 @@ async function runPipeline(videoId) {
     }
   }
 
-  // 2. Comments (hard capped at 500 threads)
+  // 2. Comments (fetched up to MAX_COMMENTS threads; the AI layer batches them)
   const { threads, truncated } = await fetchComments(videoId, { maxComments: config.comments.max })
   if (threads.length === 0) {
     const stats = buildStats({
@@ -174,6 +190,7 @@ async function runPipeline(videoId) {
       threadsFetched: threads.length,
       batchesAnalyzed: 0,
       batchesRequested: 0,
+      fetchTruncated: truncated,
     })
     return {
       video,
@@ -187,79 +204,60 @@ async function runPipeline(videoId) {
     }
   }
 
-  // 4. Batch analysis (parallel, bounded)
-  const batches = chunk(comments, config.gemini.batchSize)
-  const failedBatches = []
-
-  const results = await mapWithConcurrency(
-    batches,
-    config.gemini.concurrency,
-    async (batch, index) => analyzeBatch({ video, comments: batch, batchIndex: index, batchCount: batches.length }),
-    (err, index) => {
-      console.warn(
-        `[skipthescroll] batch ${index + 1}/${batches.length} failed: code=${err.code} status=${err.status} ${err.message}`
-      )
-      failedBatches.push({ index: index + 1, code: err.code || 'BATCH_FAILED', err })
-    }
-  )
-
-  const usable = results.filter(Boolean)
-  if (usable.length === 0) {
-    // Surface the real reason (bad key, wrong model, bad request...) instead of
-    // a generic "Gemini failed" - the batch errors are far more actionable.
-    const cause = failedBatches[0]?.err
-    const causeCode = cause?.code && cause.code !== 'GEMINI_SERVER_ERROR' && cause.code !== 'GEMINI_NETWORK'
-      ? cause.code
-      : 'ALL_BATCHES_FAILED'
-
-    throw new ApiError(
-      cause?.status && cause.status < 500 ? cause.status : 502,
-      causeCode,
-      `Gemini could not analyse any of the ${batches.length} comment batches. Root cause [${
-        cause?.code || 'unknown'
-      }]: ${cause?.message || 'unknown error'}`,
-      cause?.hint || 'Run "npm run check:gemini" inside server/ for a full Gemini diagnostic.'
-    )
-  }
-
-  // 5. Final synthesis. If this single call fails (quota exhausted, overload,
-  //    timeout) the batch work is still valuable, so we fall back to a
-  //    deterministic merge of the batch findings rather than throwing away a
-  //    full analysis of up to 500 comments.
+  // 4. Every cleaned comment is analysed. When the set does not fit one Groq
+  //    request the service splits it into paced batches (see groq.service.js),
+  //    so commentsAnalyzed is no longer capped by the AI token budget.
   const stats = buildStats({
     video,
     comments,
     cleanStats,
     threadsFetched: threads.length,
-    batchesAnalyzed: usable.length,
-    batchesRequested: batches.length,
+    batchesAnalyzed: 0,
+    batchesRequested: 0,
+    fetchTruncated: truncated,
   })
-  stats.truncated = truncated || stats.truncated
 
-  let analysis
-  let source = 'gemini'
+  // 5. AI analysis: one call when everything fits, batched extraction + a
+  //    synthesis call otherwise. Transient failures (429 burst, 5xx, network)
+  //    are retried inside the service - waits that respect a 429's retry-after
+  //    window. Whatever still fails on the very first call is a real problem
+  //    (bad key, wrong model, quota, malformed reply) and must surface as-is
+  //    instead of being hidden behind a generic "AI failed".
+  let result
   try {
-    analysis = await synthesizeFinalAnalysis({ video, batches: usable, stats })
+    result = await analyzeComments({ video, comments, stats })
   } catch (err) {
-    const cause = failedBatches[0]?.err || err
-    console.warn(
-      `[skipthescroll] final synthesis failed (${err.code || err.message}); ` +
-        'falling back to a deterministic merge of the per-batch findings.'
-    )
-    analysis = buildMergedAnalysis({ batches: usable, stats, cause })
-    source = 'gemini-partial'
+    console.warn(`[skipthescroll] AI analysis failed: code=${err.code} status=${err.status} ${err.message}`)
+    throw err
   }
 
-  // 6. Make partial failures and hard limits visible instead of hiding them.
-  const evidenceGaps = [...analysis.evidenceGaps]
-  if (failedBatches.length) {
-    evidenceGaps.push(
-      `${failedBatches.length} of ${batches.length} comment batches could not be analysed, so some evidence is missing.`
-    )
+  const { analysis, batches } = result
+  const source = 'groq'
+
+  // Report exactly what was covered: how many comments the model actually read
+  // and how many batches failed, never hiding a partial run.
+  stats.batchesAnalyzed = batches.analyzed
+  stats.batchesRequested = batches.requested
+  stats.failedBatches = batches.failed
+  stats.aiCalls = batches.aiCalls
+  stats.analysisMode = batches.singlePass ? 'single-pass' : 'batched'
+  stats.batchSize = batches.singlePass ? comments.length : batches.maxSize
+  if (batches.analyzedComments < comments.length) {
+    stats.commentsAnalyzed = batches.analyzedComments
   }
+
+  // 6. Make hard limits visible instead of hiding them.
+  const evidenceGaps = [...analysis.evidenceGaps]
   if (stats.truncated) {
     evidenceGaps.push(
-      `Only the top ${stats.commentsAnalyzed} of ${stats.commentCountOnYouTube} comments were analysed (V1 limit: 500). Rare minority experiences may be missing.`
+      `Only the top ${stats.threadsFetched} of the ${stats.commentCountOnYouTube} comments on YouTube ` +
+        `were fetched and analysed (fetch limit: ${config.comments.max}). Rare minority experiences may be missing.`
+    )
+  }
+  if (stats.failedBatches > 0) {
+    evidenceGaps.push(
+      `${stats.failedBatches} of ${stats.batchesRequested} comment batches could not be analysed ` +
+        '(AI rate limit / temporary failure), so the verdict rests on the rest of the comments. Re-run in a few minutes.'
     )
   }
   if (stats.commentsAnalyzed < 20) {
@@ -272,124 +270,6 @@ async function runPipeline(videoId) {
     stats,
     source,
     tookMs: Date.now() - startedAt,
-  }
-}
-
-/* ------------------------ deterministic fallback ------------------------ */
-
-/** Merges `{ issue, mentions }` items from every batch, most mentioned first. */
-function mergeMentioned(batches, key, limit) {
-  const totals = new Map()
-  for (const batch of batches) {
-    for (const item of batch?.[key] || []) {
-      const text = item?.issue || item?.fix
-      if (!text) continue
-      const label = text.toLowerCase()
-      const entry = totals.get(label) || { text, mentions: 0 }
-      entry.mentions += item?.mentions || 1
-      totals.set(label, entry)
-    }
-  }
-  return [...totals.values()]
-    .sort((a, b) => b.mentions - a.mentions || a.text.length - b.text.length)
-    .slice(0, limit)
-    .map((entry) => ({ [key === 'commonIssues' ? 'issue' : 'fix']: entry.text, mentions: entry.mentions }))
-}
-
-function mergeStrings(batches, key, limit) {
-  const seen = new Set()
-  const out = []
-  for (const batch of batches) {
-    for (const text of batch?.[key] || []) {
-      const label = String(text).toLowerCase()
-      if (seen.has(label)) continue
-      seen.add(label)
-      out.push(text)
-      if (out.length >= limit) return out
-    }
-  }
-  return out
-}
-
-function mergeTimestamps(batches, limit) {
-  const seen = new Set()
-  const out = []
-  for (const batch of batches) {
-    for (const item of batch?.timestamps || []) {
-      if (!item?.time) continue
-      const label = item.time.toLowerCase()
-      if (seen.has(label)) continue
-      seen.add(label)
-      out.push({ time: item.time, note: item.note || '' })
-      if (out.length >= limit) return out
-    }
-  }
-  return out
-}
-
-const FALLBACK_TONE = {
-  works: 'Yes',
-  'mostly works': 'Mostly',
-  'mixed results': 'It depends',
-  'often fails': 'Mostly not',
-  'does not work': 'No',
-}
-
-/**
- * Used only when the final Gemini call could not complete. It never invents a
- * conclusion: the verdict comes from a majority tally over the per-batch
- * findings, and the confidence is deliberately low with the reason stated.
- */
-export function buildMergedAnalysis({ batches, stats, cause }) {
-  const list = Array.isArray(batches) ? batches : []
-
-  let successVotes = 0
-  let failureVotes = 0
-  for (const batch of list) {
-    const success = (batch?.successPatterns || []).length
-    const failure = (batch?.failurePatterns || []).length
-    if (success > failure) successVotes += 1
-    else if (failure > success) failureVotes += 1
-  }
-
-  let verdict = 'mixed results'
-  if (successVotes > failureVotes) verdict = successVotes > list.length * 0.75 ? 'works' : 'mostly works'
-  else if (failureVotes > successVotes) verdict = failureVotes > list.length * 0.75 ? 'does not work' : 'often fails'
-  if (!list.length) verdict = 'unclear'
-
-  const conflicts = mergeStrings(list, 'conflictingExperiences', 6)
-  const warnings = mergeStrings(list, 'warnings', 6)
-  const commonIssues = mergeMentioned(list, 'commonIssues', 6)
-  const helpfulFixes = mergeMentioned(list, 'helpfulFixes', 6)
-  const timestamps = mergeTimestamps(list, 6)
-
-  const causeText = cause?.code ? `${cause.code}` : 'the final synthesis call failed'
-
-  return {
-    verdict,
-    doesItWork: FALLBACK_TONE[verdict] || 'Unclear',
-    // Deliberately modest: no cross-batch reasoning happened, only a merge.
-    confidence: list.length ? Math.min(45, Math.round(20 + list.length * 3)) : 0,
-    confidenceReason:
-      `Derived from ${list.length} comment batch${list.length === 1 ? '' : 'es'} without the final ` +
-      `synthesis pass (${causeText}), so patterns were merged mechanically rather than reasoned over.`,
-    summary:
-      `Comments were analysed in ${list.length} batch${list.length === 1 ? '' : 'es'} (${stats?.commentsAnalyzed ?? 0} comments). ` +
-      `${successVotes} batch${successVotes === 1 ? '' : 'es'} reported mostly success and ${failureVotes} reported mostly failure. ` +
-      `The final synthesis call failed with ${causeText}, so this verdict is a mechanical merge and should be treated as a first pass.`,
-    commonIssues,
-    helpfulFixes,
-    timestamps,
-    status: 'Partially analysed - final synthesis unavailable',
-    warnings,
-    conflictingOpinions: conflicts,
-    evidenceGaps: [
-      `The final synthesis pass did not complete [${causeText}]` +
-        (cause?.message ? `: ${String(cause.message).replace(/\s+/g, ' ').slice(0, 240)}` : '.') +
-        ' Issues and fixes below are merged from the per-batch analysis, not cross-checked against each other.',
-    ],
-    successReports: 0,
-    failureReports: 0,
   }
 }
 
@@ -433,9 +313,11 @@ export async function analyze(req, res, next) {
           meta: {
             source: data.source,
             tookMs: data.tookMs ?? Date.now(),
-            // "gemini-partial" still used the model, just not for the last pass.
-            model: data.source.startsWith('gemini') ? config.gemini.model : null,
+            // rule-based ("no comments / all spam") means the model was not used.
+            model: data.source.startsWith('groq') ? config.groq.model : null,
             commentCap: config.comments.max,
+            aiCalls: data.stats?.aiCalls ?? 0,
+            analysisMode: data.stats?.analysisMode ?? (data.source.startsWith('groq') ? 'single-pass' : 'rule-based'),
             analyzedAt: new Date().toISOString(),
           },
         }

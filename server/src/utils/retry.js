@@ -6,9 +6,10 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
  * The ONLY failures worth repeating.
  *
  * Explicitly excluded (never retried, because retrying cannot help):
- *   GEMINI_BAD_REQUEST (400/413/422), GEMINI_AUTH (401/403), GEMINI_MODEL (404),
- *   GEMINI_MALFORMED, GEMINI_EMPTY, YOUTUBE_AUTH, YOUTUBE_ERROR,
- *   VIDEO_ID_*, COMMENTS_DISABLED, VIDEO_NOT_FOUND and every other 4xx.
+ *   GROQ_BAD_REQUEST (400/422), GROQ_REQUEST_TOO_LARGE (413), GROQ_AUTH (401/403),
+ *   GROQ_MODEL (404), GROQ_QUOTA_EXCEEDED, GROQ_MALFORMED, GROQ_EMPTY,
+ *   YOUTUBE_AUTH, YOUTUBE_ERROR, VIDEO_ID_*, COMMENTS_DISABLED,
+ *   VIDEO_NOT_FOUND and every other 4xx.
  *
  * Retried: network failures, client timeouts, 408, 429 and 5xx.
  */
@@ -17,22 +18,22 @@ const RETRYABLE_CODES = new Set([
   'YOUTUBE_NETWORK',
   'YOUTUBE_SERVER_ERROR',
   'YOUTUBE_RATE_LIMIT',
-  // Gemini
-  'GEMINI_NETWORK',
-  'GEMINI_TIMEOUT',
-  'GEMINI_RATE_LIMIT',
-  'GEMINI_SERVER_ERROR',
-  'GEMINI_OVERLOADED',
+  // Groq
+  'GROQ_NETWORK',
+  'GROQ_TIMEOUT',
+  'GROQ_RATE_LIMIT',
+  'GROQ_SERVER_ERROR',
+  'GROQ_OVERLOADED',
 ])
 
 /**
  * Codes that deserve MORE patience than the default policy.
- * GEMINI_OVERLOADED is HTTP 503 UNAVAILABLE / "high demand", which is a
- * function of how busy the model is rather than a fault in the request, so it
- * gets extra attempts and much longer waits.
+ * GROQ_OVERLOADED is HTTP 503 / "overloaded", which is a function of how busy
+ * the model is rather than a fault in the request, so it gets extra attempts
+ * and much longer waits.
  */
 const PATIENCE_OVERRIDES = {
-  GEMINI_OVERLOADED: { retries: 5, baseDelayMs: 2000, factor: 2, maxDelayMs: 30_000 },
+  GROQ_OVERLOADED: { retries: 5, baseDelayMs: 2000, factor: 2, maxDelayMs: 30_000 },
 }
 
 export { RETRYABLE_CODES, PATIENCE_OVERRIDES }
@@ -82,7 +83,12 @@ export async function withRetry(fn, options = {}) {
       const canRetry = attempt < retries && RETRYABLE_CODES.has(err?.code)
       if (!canRetry) throw err
 
-      const delay = Math.min(maxDelayMs, baseDelayMs * factor ** attempt)
+      // A Groq burst 429 reports how long until the per-minute budget resets
+      // (retry-after). Wait at least that long so the next attempt can actually
+      // pass instead of burning retries on a window that has not reset yet.
+      // Cap it so a huge "retry in 1 hour" does not block the server for an hour.
+      const windowWait = Math.min(err?.retryAfterMs || 0, 60_000)
+      const delay = Math.max(Math.min(maxDelayMs, baseDelayMs * factor ** attempt), windowWait)
       const jittered = Math.round(delay * (0.75 + Math.random() * 0.5))
       attempt += 1
 
